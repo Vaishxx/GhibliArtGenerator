@@ -1,0 +1,77 @@
+!pip install -q diffusers transformers accelerate pillow torch clip-interrogator==0.6.0
+
+import torch
+import io
+from PIL import Image
+from google.colab import files
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from clip_interrogator import Config, Interrogator
+from diffusers import StableDiffusionImg2ImgPipeline
+
+# Load models once
+@torch.no_grad()
+def load_models():
+    blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+    blip_model = BlipForConditionalGeneration.from_pretrained(
+        "Salesforce/blip-image-captioning-large",
+        torch_dtype=torch.float16
+    ).to("cuda")
+
+    ci = Interrogator(Config(
+        clip_model_name="ViT-L-14/openai",
+        device="cuda"
+    ))
+
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        "nitrosocke/Ghibli-Diffusion",
+        torch_dtype=torch.float16
+    ).to("cuda")
+    pipe.enable_attention_slicing()
+    pipe.enable_model_cpu_offload()
+
+    return blip_processor, blip_model, ci, pipe
+
+# Initialize and keep models in memory
+blip_processor, blip_model, ci, pipe = load_models()
+def process_single_image():
+    # Upload and process one image
+    uploaded = files.upload()
+    if not uploaded:
+        return print("No image uploaded!")
+
+    # Load image
+    data = next(iter(uploaded.values()))
+    img = Image.open(io.BytesIO(data)).convert("RGB").resize((768, 768))
+
+    # Generate prompt
+    inputs = blip_processor(img, return_tensors="pt").to("cuda", torch.float16)
+    caption = blip_model.generate(**inputs, max_new_tokens=50)[0]
+    content_desc = blip_processor.decode(caption, skip_special_tokens=True)
+
+    style_terms = ci.interrogate_classic(img)
+    style_keywords = [term for term in style_terms.split(', ')
+                    if any(kw in term.lower() for kw in ['ghibli', 'anime'])]
+
+    prompt = f"Studio Ghibli style: {content_desc}. Features: {', '.join(style_keywords)}"
+
+    # Generate image
+    with torch.autocast("cuda"), torch.inference_mode():
+        result = pipe(
+            prompt=prompt,
+            image=img,
+            strength=0.7,
+            guidance_scale=10,
+            num_inference_steps=45
+        ).images[0]
+
+    # Show and save
+    display(result)
+    result.save("latest_ghibli_output.jpg")
+    files.download("latest_ghibli_output.jpg")
+
+    # Cleanup
+    del img, result
+    torch.cuda.empty_cache()
+
+# Run processing
+process_single_image()
